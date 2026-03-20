@@ -5,11 +5,16 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
+import hashlib
 from pathlib import Path
+from typing import Optional
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +23,36 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teacher credentials from JSON file
+teachers_file = Path(__file__).parent / "teachers.json"
+with open(teachers_file) as f:
+    teachers_data = json.load(f)
+
+# In-memory store for active session tokens
+active_tokens: set = set()
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _hash_password(password: str, salt: str) -> str:
+    """Hash a password using PBKDF2-HMAC-SHA256 with the provided hex salt."""
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), 260000
+    ).hex()
+
+
+def get_current_teacher(authorization: Optional[str] = Header(None)):
+    """Dependency that validates the Bearer token and requires authentication."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization[7:]
+    if token not in active_tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return token
 
 # In-memory activity database
 activities = {
@@ -83,13 +118,44 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/login")
+def login(credentials: LoginRequest):
+    """Login as a teacher and receive a session token"""
+    for teacher in teachers_data["teachers"]:
+        if teacher["username"] == credentials.username:
+            password_hash = _hash_password(credentials.password, teacher["salt"])
+            if secrets.compare_digest(teacher["password_hash"], password_hash):
+                token = secrets.token_hex(32)
+                active_tokens.add(token)
+                return {"token": token, "message": "Login successful"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+@app.post("/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    """Logout and invalidate the current session token"""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        active_tokens.discard(token)
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/auth/status")
+def auth_status(authorization: Optional[str] = Header(None)):
+    """Check whether the current token is valid"""
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"authenticated": False}
+    token = authorization[7:]
+    return {"authenticated": token in active_tokens}
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, _: str = Depends(get_current_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +177,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, _: str = Depends(get_current_teacher)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
